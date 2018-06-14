@@ -375,6 +375,58 @@
       :else
       nil)))
 
+(defn- reconcile-position-for-collection
+  [collection-id old-position new-position]
+  (when (not= new-position old-position)
+    (cond
+      (and (nil? new-position)
+           old-position)
+      (db/update-where! Card {:collection_id collection-id
+                              :collection_position [:> old-position]}
+        :collection_position (honeysql.types/call :- :collection_position 1))
+
+      (and new-position (nil? old-position))
+      (db/update-where! Card {:collection_id collection-id
+                              :collection_position [:>= new-position]}
+        :collection_position (honeysql.types/call :+ :collection_position 1))
+      (> new-position old-position)
+      (db/update-where! Card {:collection_id collection-id
+                              :collection_position [:<= new-position]}
+        :collection_position (honeysql.types/call :- :collection_position 1))
+      (< new-position old-position)
+      (db/update-where! Card {:collection_id collection-id
+                              :collection_position [:>= new-position]}
+        :collection_position (honeysql.types/call :+ :collection_position 1)))))
+
+(defn- maybe-reconcile-collection-position
+  [{old-collection-id :collection_id, old-position :collection_position, :as card-before-update}
+   {new-collection-id :collection_id, new-position :collection_position, :as card-updates}]
+
+  (let [updated-collection? (and (contains? card-updates :collection_id)
+                                 (not= old-collection-id new-collection-id))
+        updated-position?   (and (contains? card-updates :collection_position)
+                                 (not= old-position new-position))]
+    (cond
+      ;; If the collection hasn't changed, but we have a new collection position, we might need to reconcile
+      (and (not updated-collection?) updated-position?)
+      (reconcile-position-for-collection new-collection-id old-position new-position)
+
+      ;; If we have a new collection id, but no new position, reconcile the old collection, then update the new
+      ;; collection with the existing position
+      (and updated-collection? (not updated-position?))
+      (do
+        (reconcile-position-for-collection old-collection-id old-position nil)
+        (reconcile-position-for-collection new-collection-id nil old-position))
+
+      ;; We have a new collection id AND and new collection position
+      ;; Update the old collection using the old position
+      ;; Update the new collection using the new position
+      (and updated-collection? updated-position?)
+      (do
+        (reconcile-position-for-collection old-collection-id old-position nil)
+        (reconcile-position-for-collection new-collection-id nil new-position)))))
+
+
 (api/defendpoint PUT "/:id"
   "Update a `Card`."
   [id :as {{:keys [dataset_query description display name visualization_settings archived collection_id
@@ -402,6 +454,9 @@
     (let [card-updates (assoc card-updates
                          :result_metadata (result-metadata-for-updating card-before-update dataset_query
                                                                         result_metadata metadata_checksum))]
+
+      (maybe-reconcile-collection-position card-before-update card-updates)
+
       ;; ok, now save the Card
       (db/update! Card id
         ;; `collection_id` and `description` can be `nil` (in order to unset them). Other values should only be
@@ -454,26 +509,64 @@
 
 ;;; -------------------------------------------- Bulk Collections Update ---------------------------------------------
 
+(defn- update-collection-positions!
+  "For cards that have a position in the previous collection, add them to the end of the new collection, trying to
+  preseve the order from the original collections. Note it's possible for there to be multiple collections
+  (and thus duplicate collection positions) merged into this new collection. No special tie breaker logic for when
+  that's the case, just use the order the DB returned it in"
+  [new-collection-id-or-nil cards]
+  ;; Sorting by `:collection_position` put ensure lower position cards are appended first
+  (let [sorted-cards        (sort-by :collection_position cards)
+        max-position-result (db/select-one [Card [:%max.collection_position :max_position]]
+                              :collection_id new-collection-id-or-nil)
+        ;; collection_position for the next card in the collection
+        starting-position   (inc (get max-position-result :max_position 0))]
+
+    (doall
+     (map (fn [idx {:keys [collection_id collection_position] :as card}]
+            ;; We are removing this card from `collection_id` so we need to reconcile any
+            ;; `collection_position` entries left behind by this move
+            (reconcile-position-for-collection collection_id collection_position nil)
+            ;; Now we can update the card with the new collection and a new calculated position
+            ;; that appended to the end
+            (db/update! Card (u/get-id card)
+              :collection_position idx
+              :collection_id       new-collection-id-or-nil))
+          ;; These are reversed because of the classic issue when removing an item from array. If we remove an
+          ;; item at index 1, everthing above index 1 will get decremented. By reversing our processing order we
+          ;; can avoid changing the index of cards we haven't yet updated
+          (reverse (range starting-position (+ (count sorted-cards) starting-position)))
+          (reverse sorted-cards)))))
+
 (defn- move-cards-to-collection! [new-collection-id-or-nil card-ids]
   ;; if moving to a collection, make sure we have write perms for it
   (when new-collection-id-or-nil
     (api/write-check Collection new-collection-id-or-nil))
   ;; for each affected card...
   (when (seq card-ids)
-    (let [cards (db/select [Card :id :collection_id :dataset_query]
+    (let [cards (db/select [Card :id :collection_id :collection_position :dataset_query]
                   {:where [:and [:in :id (set card-ids)]
-                                [:or [:not= :collection_id new-collection-id-or-nil]
-                                     (when new-collection-id-or-nil
-                                       [:= :collection_id nil])]]})] ; poisioned NULLs = ick
+                           [:or [:not= :collection_id new-collection-id-or-nil]
+                            (when new-collection-id-or-nil
+                              [:= :collection_id nil])]]})] ; poisioned NULLs = ick
       ;; ...check that we have write permissions for it...
       (doseq [card cards]
         (api/write-check card))
       ;; ...and check that we have write permissions for the old collections if applicable
       (doseq [old-collection-id (set (filter identity (map :collection_id cards)))]
-        (api/write-check Collection old-collection-id)))
-    ;; ok, everything checks out. Set the new `collection_id` for all the Cards
-    (db/update-where! Card {:id [:in (set card-ids)]}
-      :collection_id new-collection-id-or-nil)))
+        (api/write-check Collection old-collection-id))
+
+      ;; If any of the cards have a `:collection_position`, we'll need to fixup the old collection now that the cards
+      ;; are gone and update the position in the new collection
+      (when-let [cards-with-position (seq (filter :collection_position cards))]
+        (update-collection-positions! new-collection-id-or-nil cards-with-position))
+
+      ;; ok, everything checks out. Set the new `collection_id` for all the Cards that haven't been updated already
+      (when-let [cards-without-position (seq (for [card cards
+                                                   :when (not (:collection_position card))]
+                                               (u/get-id card)))]
+        (db/update-where! Card {:id [:in (set cards-without-position)]}
+          :collection_id new-collection-id-or-nil)))))
 
 (api/defendpoint POST "/collections"
   "Bulk update endpoint for Card Collections. Move a set of `Cards` with CARD_IDS into a `Collection` with

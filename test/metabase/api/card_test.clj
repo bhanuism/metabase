@@ -570,6 +570,129 @@
      {:collection_position nil})
     (db/select-one-field :collection_position Card :id (u/get-id card))))
 
+(defn- name->position [{:keys [items] :as results}]
+  (zipmap (map :name items)
+          (map :collection_position items)))
+
+;; Change the position of the 4th card to 1st, all other cards should bump their position by 1
+(expect
+  {"d" 1
+   "a" 2
+   "b" 3
+   "c" 4}
+  (tt/with-temp* [Collection [{coll-id :id :as collection}]
+                  Card       [card-a {:name "a", :collection_id coll-id, :collection_position 1}]
+                  Card       [card-b {:name "b", :collection_id coll-id, :collection_position 2}]
+                  Card       [card-c {:name "c", :collection_id coll-id, :collection_position 3}]
+                  Card       [card-d {:name "d", :collection_id coll-id, :collection_position 4}]]
+    (perms/grant-collection-readwrite-permissions! (perms-group/all-users) collection)
+    ((user->client :rasta) :put 200 (str "card/" (u/get-id card-d))
+     {:collection_position 1, :collection_id coll-id})
+    (name->position ((user->client :rasta) :get 200 (str "collection/" coll-id)  :model "card" :archived "false"))))
+
+;; Change the position of the 1st card to the 4th, all of the other cards should bump down
+(expect
+  {"b" 1
+   "c" 2
+   "d" 3
+   "a" 4}
+  (tt/with-temp* [Collection [{coll-id :id :as collection}]
+                  Card       [card-a {:name "a", :collection_id coll-id, :collection_position 1}]
+                  Card       [card-b {:name "b", :collection_id coll-id, :collection_position 2}]
+                  Card       [card-c {:name "c", :collection_id coll-id, :collection_position 3}]
+                  Card       [card-d {:name "d", :collection_id coll-id, :collection_position 4}]]
+    (perms/grant-collection-readwrite-permissions! (perms-group/all-users) collection)
+    ((user->client :rasta) :put 200 (str "card/" (u/get-id card-a))
+     {:collection_position 4, :collection_id coll-id})
+    (name->position ((user->client :rasta) :get 200 (str "collection/" coll-id)  :model "card" :archived "false"))))
+
+;; Change the position of the 1st card to the 4th, all of the other cards should bump down
+(expect
+  {"a" 1
+   "b" 2
+   "c" 3
+   "d" 4}
+  (tt/with-temp* [Collection [{coll-id :id :as collection}]
+                  Card       [card-a {:name "a", :collection_id coll-id, :collection_position 1}]
+                  ;; Card b does not start with a collection_position
+                  Card       [card-b {:name "b", :collection_id coll-id}]
+                  Card       [card-c {:name "c", :collection_id coll-id, :collection_position 2}]
+                  Card       [card-d {:name "d", :collection_id coll-id, :collection_position 3}]]
+    (perms/grant-collection-readwrite-permissions! (perms-group/all-users) collection)
+    ((user->client :rasta) :put 200 (str "card/" (u/get-id card-b))
+     {:collection_position 2, :collection_id coll-id})
+    (name->position ((user->client :rasta) :get 200 (str "collection/" coll-id) :model "card" :archived "false"))))
+
+;; Change the position of the 1st card to the 4th, all of the other cards should bump down
+(expect
+  {"a" 1
+   "b" nil
+   "c" 2
+   "d" 3}
+  (tt/with-temp* [Collection [{coll-id :id :as collection}]
+                  Card       [card-a {:name "a", :collection_id coll-id, :collection_position 1}]
+                  Card       [card-b {:name "b", :collection_id coll-id, :collection_position 2}]
+                  Card       [card-c {:name "c", :collection_id coll-id, :collection_position 3}]
+                  Card       [card-d {:name "d", :collection_id coll-id, :collection_position 4}]]
+    (perms/grant-collection-readwrite-permissions! (perms-group/all-users) collection)
+    ((user->client :rasta) :put 200 (str "card/" (u/get-id card-b))
+     {:collection_position nil, :collection_id coll-id})
+    (name->position ((user->client :rasta) :get 200 (str "collection/" coll-id) :model "card" :archived "false"))))
+
+;; Change the collection the card is in, leave the position, will cause old and new collection to have their positions updated
+(expect
+  {"a" 1
+   "f" 2
+   "b" 3
+   "c" 4
+   "d" 5
+   "e" 1
+   "g" 2
+   "h" 3}
+  (tt/with-temp* [Collection [{coll-id-1 :id :as collection-1}]
+                  Collection [{coll-id-2 :id :as collection-2}]
+                  Card       [card-a {:name "a", :collection_id coll-id-1, :collection_position 1}]
+                  Card       [card-b {:name "b", :collection_id coll-id-1, :collection_position 2}]
+                  Card       [card-c {:name "c", :collection_id coll-id-1, :collection_position 3}]
+                  Card       [card-d {:name "d", :collection_id coll-id-1, :collection_position 4}]
+                  Card       [card-e {:name "e", :collection_id coll-id-2, :collection_position 1}]
+                  Card       [card-f {:name "f", :collection_id coll-id-2, :collection_position 2}]
+                  Card       [card-g {:name "g", :collection_id coll-id-2, :collection_position 3}]
+                  Card       [card-h {:name "h", :collection_id coll-id-2, :collection_position 4}]]
+    (perms/grant-collection-readwrite-permissions! (perms-group/all-users) collection-1)
+    (perms/grant-collection-readwrite-permissions! (perms-group/all-users) collection-2)
+    ((user->client :rasta) :put 200 (str "card/" (u/get-id card-f))
+     {:collection_id coll-id-1})
+    (merge (name->position ((user->client :rasta) :get 200 (str "collection/" coll-id-1)  :model "card" :archived "false"))
+           (name->position ((user->client :rasta) :get 200 (str "collection/" coll-id-2)  :model "card" :archived "false")))))
+
+;; Change the collection and the position, causing both to collections to have their order changed
+(expect
+  {"h" 1
+   "a" 2
+   "b" 3
+   "c" 4
+   "d" 5
+   "e" 1
+   "f" 2
+   "g" 3}
+  (tt/with-temp* [Collection [{coll-id-1 :id :as collection-1}]
+                  Collection [{coll-id-2 :id :as collection-2}]
+                  Card       [card-a {:name "a", :collection_id coll-id-1, :collection_position 1}]
+                  Card       [card-b {:name "b", :collection_id coll-id-1, :collection_position 2}]
+                  Card       [card-c {:name "c", :collection_id coll-id-1, :collection_position 3}]
+                  Card       [card-d {:name "d", :collection_id coll-id-1, :collection_position 4}]
+                  Card       [card-e {:name "e", :collection_id coll-id-2, :collection_position 1}]
+                  Card       [card-f {:name "f", :collection_id coll-id-2, :collection_position 2}]
+                  Card       [card-g {:name "g", :collection_id coll-id-2, :collection_position 3}]
+                  Card       [card-h {:name "h", :collection_id coll-id-2, :collection_position 4}]]
+    (perms/grant-collection-readwrite-permissions! (perms-group/all-users) collection-1)
+    (perms/grant-collection-readwrite-permissions! (perms-group/all-users) collection-2)
+    ((user->client :rasta) :put 200 (str "card/" (u/get-id card-h))
+     {:collection_position 1, :collection_id coll-id-1})
+    (merge (name->position ((user->client :rasta) :get 200 (str "collection/" coll-id-1)  :model "card" :archived "false"))
+           (name->position ((user->client :rasta) :get 200 (str "collection/" coll-id-2)  :model "card" :archived "false")))))
+
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                        Card updates that impact alerts                                         |
@@ -1035,6 +1158,46 @@
     (perms/grant-collection-readwrite-permissions! (perms-group/all-users) collection)
     (POST-card-collections! :rasta 403 collection [card-1 card-2])))
 
+;; Test that we can bulk move some Cards from one collection to another, while updating the collection position of the
+;; old collection and the new collection
+(expect
+  [{:response    {:status "ok"}
+    :collections ["New Collection" "New Collection"]}
+   {"a" 4 ;-> Moved to the new collection, gets the first slot available
+    "b" 5
+    "c" 1 ;-> With a and b no longer in the collection, c is first
+    "d" 1 ;-> Existing cards in new collection are untouched and position unchanged
+    "e" 2
+    "f" 3}]
+  (tt/with-temp* [Collection [{coll-id-1 :id}      {:name "Old Collection"}]
+                  Collection [{coll-id-2 :id
+                               :as new-collection} {:name "New Collection"}]
+                  Card       [card-a               {:name "a", :collection_id coll-id-1, :collection_position 1}]
+                  Card       [card-b               {:name "b", :collection_id coll-id-1, :collection_position 2}]
+                  Card       [card-c               {:name "c", :collection_id coll-id-1, :collection_position 3}]
+                  Card       [card-d               {:name "d", :collection_id coll-id-2, :collection_position 1}]
+                  Card       [card-e               {:name "e", :collection_id coll-id-2, :collection_position 2}]
+                  Card       [card-f               {:name "f", :collection_id coll-id-2, :collection_position 3}]]
+    [(POST-card-collections! :crowberto 200 new-collection [card-a card-b])
+     (merge (name->position ((user->client :crowberto) :get 200 (str "collection/" coll-id-1)  :model "card" :archived "false"))
+            (name->position ((user->client :crowberto) :get 200 (str "collection/" coll-id-2)  :model "card" :archived "false")))]))
+
+;; Moving a card without a collection_position keeps the collection_position nil
+(expect
+  [{:response    {:status "ok"}
+    :collections ["New Collection" "New Collection"]}
+   {"a" nil
+    "b" 1
+    "c" 2}]
+  (tt/with-temp* [Collection [{coll-id-1 :id}      {:name "Old Collection"}]
+                  Collection [{coll-id-2 :id
+                               :as new-collection} {:name "New Collection"}]
+                  Card       [card-a               {:name "a", :collection_id coll-id-1}]
+                  Card       [card-b               {:name "b", :collection_id coll-id-2, :collection_position 1}]
+                  Card       [card-c               {:name "c", :collection_id coll-id-2, :collection_position 2}]]
+    [(POST-card-collections! :crowberto 200 new-collection [card-a card-b])
+     (merge (name->position ((user->client :crowberto) :get 200 (str "collection/" coll-id-1)  :model "card" :archived "false"))
+            (name->position ((user->client :crowberto) :get 200 (str "collection/" coll-id-2)  :model "card" :archived "false")))]))
 
 ;;; +----------------------------------------------------------------------------------------------------------------+
 ;;; |                                            PUBLIC SHARING ENDPOINTS                                            |
