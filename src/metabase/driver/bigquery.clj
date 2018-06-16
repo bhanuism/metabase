@@ -145,7 +145,7 @@
    (let [request (doto (QueryRequest.)
                    (.setTimeoutMs (* query-timeout-seconds 1000))
                    ;; if the query contains a `#standardSQL` directive then use Standard SQL instead of legacy SQL
-                   (.setUseLegacySql (not (str/includes? (str/lower-case query-string) "#standardsql")))
+                   (.setUseLegacySql false)
                    (.setQuery query-string))]
      (google/execute (.query (.jobs client) project-id request)))))
 
@@ -268,15 +268,15 @@
 
 ;; Make the dataset-id the "schema" of every field or table in the query because otherwise BigQuery can't figure out
 ;; where things is from
-(defn- qualify-fields-and-tables-with-dataset-id [{{{:keys [dataset-id]} :details} :database, :as query}]
+(defn- qualify-fields-and-tables-with-dataset-id [{{{:keys [project-id dataset-id]} :details} :database, :as query}]
   (walk/postwalk (fn [x]
                    (cond
                      ;; TODO - it is inconvenient that we use different keys for `schema` across different classes. We
                      ;; should one day refactor to use the same key everywhere.
                      (instance? metabase.query_processor.interface.Field x)     (assoc x :schema-name dataset-id)
-                     (instance? metabase.query_processor.interface.JoinTable x) (assoc x :schema      dataset-id)
+                     (instance? metabase.query_processor.interface.JoinTable x) (assoc x :schema (str project-id "." dataset-id))
                      :else                                                      x))
-                 (assoc-in query [:query :source-table :schema] dataset-id)))
+                 (assoc-in query [:query :source-table :schema] (str project-id "." dataset-id))))
 
 (defn- honeysql-form [outer-query]
   (sqlqp/build-honeysql-form driver (qualify-fields-and-tables-with-dataset-id outer-query)))
@@ -399,7 +399,7 @@
               :else
               (name ag-type)))
 
-    :else (str schema-name \. table-name \. field-name)))
+    :else field-name))
 
 ;; TODO - Making 2 DB calls for each field to fetch its dataset is inefficient and makes me cry, but this method is
 ;; currently only used for SQL params so it's not a huge deal at this point
@@ -409,7 +409,7 @@
     (hsql/raw (apply format "[%s.%s.%s]" dataset (field/qualified-name-components field)))))
 
 (defn- field->breakout-identifier [driver field]
-  (hsql/raw (str \[ (field->alias driver field) \])))
+  (hsql/raw (str \` (field->alias driver field) \`)))
 
 (defn- apply-breakout [driver honeysql-form {breakout-fields :breakout, fields-fields :fields}]
   (-> honeysql-form
@@ -426,9 +426,9 @@
   [honeysql-form {join-tables :join-tables, {source-table-name :name, source-schema :schema} :source-table}]
   (loop [honeysql-form honeysql-form, [{:keys [table-name pk-field source-field schema join-alias]} & more] join-tables]
     (let [honeysql-form (h/merge-left-join honeysql-form
-                          [(hx/qualify-and-escape-dots schema table-name) (hx/qualify-and-escape-dots schema join-alias)]
-                          [:= (hx/qualify-and-escape-dots source-schema source-table-name (:field-name source-field))
-                              (hx/qualify-and-escape-dots schema join-alias               (:field-name pk-field))])]
+                          [(hx/qualify-and-escape-dots schema table-name) (hx/qualify-and-escape-dots join-alias)]
+                          [:= (hx/qualify-and-escape-dots source-table-name (:field-name source-field))
+                              (hx/qualify-and-escape-dots join-alias               (:field-name pk-field))])]
       (if (seq more)
         (recur honeysql-form more)
         honeysql-form))))
@@ -470,7 +470,7 @@
           :field->identifier         (u/drop-first-arg field->identifier)
           ;; we want identifiers quoted [like].[this] initially (we have to convert them to [like.this] before
           ;; executing)
-          :quote-style               (constantly :sqlserver)
+          :quote-style               (constantly :mysql)
           :string-length-fn          (u/drop-first-arg string-length-fn)
           :unix-timestamp->timestamp (u/drop-first-arg unix-timestamp->timestamp)})
 
