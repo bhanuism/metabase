@@ -232,7 +232,7 @@
   (hsql/call :strftime_utc_usec µs (hx/literal format-str)))
 
 (defn- trunc-with-format [format-str timestamp]
-  (hx/->timestamp (microseconds->str format-str (->microseconds timestamp))))
+  (hx/->timestamp (hsql/call :format_timestamp (hx/literal format-str) timestamp)))
 
 (defn- date [unit expr]
   (case unit
